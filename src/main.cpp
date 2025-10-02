@@ -1,19 +1,31 @@
 // ES-EKF
 #include <Wire.h>
 #include <SparkFun_u-blox_GNSS_v3.h>
-#include <ModbusMaster.h>
-#include <WTGAHRS3_485.h>
+// #include <ModbusMaster.h>
+// #include <WTGAHRS3_485.h>
 #include <esp_now.h>
 #include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <REG.h>
+#include <wit_c_sdk.h>
 
 #define RXD2 16
 #define TXD2 17
 #define SENSOR_SLAVE_ID 0x50
 
+int i;
+float fAcc[3], fGyro[3], fAngle[3];
+
+#define ACC_UPDATE 0x01
+#define GYRO_UPDATE 0x02
+#define ANGLE_UPDATE 0x04
+#define MAG_UPDATE 0x08
+#define READ_UPDATE 0x80
+static volatile char s_cDataUpdate = 0, s_cCmd = 0xff;
+
 // --- CẤU HÌNH BỘ LỌC ---
-const int STATE_DIM = 8; // Kích thước của cả Nominal State và Error State
+const int STATE_DIM = 5; // Kích thước của cả Nominal State và Error State
 
 // --- BIẾN TOÀN CỤC ---
 SFE_UBLOX_GNSS myGNSS;
@@ -21,9 +33,9 @@ SFE_UBLOX_GNSS myGNSS;
 esp_now_peer_info_t peerInfo;
 uint8_t broadcastAddress[] = {0x24, 0xD7, 0xEB, 0x13, 0x74, 0xAC};
 
-ModbusMaster node;
-HardwareSerial RS485(1);
-WTGAHRS3_485 sensor(node);
+// ModbusMaster node;
+// HardwareSerial RS485(1);
+// WTGAHRS3_485 sensor(node);
 SemaphoreHandle_t stateMutex;
 
 // --- KHAI BÁO CÁC STRUCT VÀ HÀM TIỆN ÍCH (Giữ nguyên) ---
@@ -36,6 +48,9 @@ struct PointECEF
   double x, y, z;
 };
 
+PointLLH initialLLH;
+PointECEF initialECEF;
+
 // Trạng thái danh nghĩa (Nominal State) - Ước tính chính của hệ thống
 double nominal_state[STATE_DIM] = {0}; // [p_e, p_n, v_e, v_n, theta, b_ax, b_ay, b_gz]
 
@@ -44,6 +59,8 @@ double P[STATE_DIM * STATE_DIM] = {0};
 
 // Ma trận nhiễu quá trình cho TRẠNG THÁI LỖI
 double Q[STATE_DIM * STATE_DIM] = {0};
+
+double R_yaw;
 
 // --- Các biến phần cứng và hệ quy chiếu ---
 double accel[2], gyro_z;
@@ -60,11 +77,11 @@ const double WGS84_E2 = 0.00669437999014;
 void GetRTK(PointLLH &_CurrentPos)
 {
   // put your main code here, to run repeatedly:
-  long latitude = myGNSS.getHighResLatitude();
+  int32_t latitude = myGNSS.getHighResLatitude();
   int8_t latitudeHp = myGNSS.getHighResLatitudeHp();
   _CurrentPos.latitude = ((double)latitude / 10000000.0) + ((double)latitudeHp / 1000000000.0);
 
-  long longitude = myGNSS.getHighResLongitude();
+  int32_t longitude = myGNSS.getHighResLongitude();
   int8_t longitudeHp = myGNSS.getHighResLongitudeHp();
   _CurrentPos.longitude = ((double)longitude / 10000000.0) + ((double)longitudeHp / 1000000000.0);
 
@@ -102,6 +119,10 @@ void ecefToEnu(const PointECEF &current_ecef, double &east, double &north, doubl
   double dx = current_ecef.x - enu_origin_ecef.x;
   double dy = current_ecef.y - enu_origin_ecef.y;
   double dz = current_ecef.z - enu_origin_ecef.z;
+  // Serial.print("dx=");
+  // Serial.print(dx, 4);
+  // Serial.print(",dy=");
+  // Serial.println(dy, 4);
 
   east = ecef_to_enu_matrix[0][0] * dx + ecef_to_enu_matrix[0][1] * dy + ecef_to_enu_matrix[0][2] * dz;
   north = ecef_to_enu_matrix[1][0] * dx + ecef_to_enu_matrix[1][1] * dy + ecef_to_enu_matrix[1][2] * dz;
@@ -109,14 +130,11 @@ void ecefToEnu(const PointECEF &current_ecef, double &east, double &north, doubl
 }
 
 /**
- * @brief Thiết lập gốc ENU và ma trận chuyển đổi từ ECEF sang ENU.
+ * @brief Tính ma trận chuyển đổi từ ECEF sang ENU dựa trên gốc ENU.
  * @param origin_llh Tọa độ gốc ENU ở dạng LLH.
- * @param origin_ecef Tọa độ gốc ENU ở dạng ECEF.
  */
-void setupEnuOrigin(const PointLLH &origin_llh, const PointECEF &origin_ecef)
+void CalculateEnuMatrix(const PointLLH &origin_llh)
 {
-  enu_origin_ecef = origin_ecef;
-
   double latRad = origin_llh.latitude * M_PI / 180.0;
   double lonRad = origin_llh.longitude * M_PI / 180.0;
   double sLat = sin(latRad);
@@ -136,6 +154,17 @@ void setupEnuOrigin(const PointLLH &origin_llh, const PointECEF &origin_ecef)
   ecef_to_enu_matrix[2][0] = cLat * cLon;
   ecef_to_enu_matrix[2][1] = cLat * sLon;
   ecef_to_enu_matrix[2][2] = sLat;
+
+  Serial.println("ECEF to ENU matrix:");
+  for (int i = 0; i < 3; i++)
+  {
+    for (int j = 0; j < 3; j++)
+    {
+      Serial.print(ecef_to_enu_matrix[i][j], 6);
+      Serial.print(" ");
+    }
+    Serial.println();
+  }
 }
 
 /**
@@ -145,173 +174,221 @@ void setupEnuOrigin(const PointLLH &origin_llh, const PointECEF &origin_ecef)
  */
 double normalizeAngle(double angle)
 {
-  // Dùng fmod để đưa góc về khoảng [-2π, 2π]
-  angle = fmod(angle + M_PI, 2.0 * M_PI);
-  if (angle < 0)
-  {
-    angle += 2.0 * M_PI;
-  }
-  return angle - M_PI;
+  return atan2(sin(angle), cos(angle));
 }
+
 // --- KẾT THÚC KHAI BÁO ---
+const int LOOP_FREQ_HZ = 90;                              // Tần số vòng lặp mong muốn (Hz)
+const unsigned long LOOP_PERIOD_MS = 1000 / LOOP_FREQ_HZ; // Chu kỳ vòng lặp (ms)
+void loopRate(int freq)
+{
+  static unsigned long lastLoopTime = 0;
+  unsigned long currentTime = millis();
+  unsigned long loopPeriodMs = 1000 / freq; // Chu kỳ vòng lặp (ms)
+
+  // Tính thời gian đã trôi qua kể từ lần chạy trước
+  unsigned long elapsedTime = currentTime - lastLoopTime;
+
+  // Nếu thời gian đã trôi qua nhỏ hơn chu kỳ mong muốn, thêm độ trễ
+  if (elapsedTime < loopPeriodMs)
+  {
+    // Serial.println("adfdasfd");
+    TickType_t delayTicks = (loopPeriodMs - elapsedTime) / portTICK_PERIOD_MS;
+    vTaskDelay(delayTicks);
+  }
+
+  // Cập nhật thời gian cho lần chạy tiếp theo
+  lastLoopTime = millis();
+}
 
 void predictionTask(void *pvParameters)
 {
-  const TickType_t xFrequency = 10 / portTICK_PERIOD_MS; // 100Hz
+  // Tần số mục tiêu là 98Hz -> Chu kỳ = 1000/98 ≈ 10.2ms.
+  // Làm tròn đến số nguyên tick gần nhất (1 tick = 1ms) là 10ms -> Tần số thực tế 100Hz.
+  const TickType_t xFrequency = 10 / portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  // (Đề xuất) Đo lường dt thực tế để tăng độ chính xác
+  uint64_t last_time_us = esp_timer_get_time();
+  long prediction_counter = 0;
   while (1)
   {
-    // Đọc IMU và chuyển đổi gyro_z sang rad/s
-    AccelerationData Accel = sensor.getAccelerationData();
-    AngularVelocityData Gyro = sensor.getAngularVelocityData();
-    if (Accel.isDataValid && Gyro.isDataValid)
+    // Tính toán dt thực tế giữa các lần lặp
+    uint64_t current_time_us = esp_timer_get_time();
+    double dt = (current_time_us - last_time_us) / 1000000.0;
+    last_time_us = current_time_us;
+    double measured_yaw = 0;
+    // Bỏ qua nếu dt quá lớn (ví dụ: do một tác vụ khác gây trễ)
+    if (dt > 0.05 || dt <= 0)
     {
-      accel[0] = Accel.accelX;
-      accel[1] = Accel.accelY;
-      gyro_z = Gyro.angularVelZ * M_PI / 180.0;
+      vTaskDelayUntil(&xLastWakeTime, xFrequency); // Vẫn phải delay để tránh task chạy liên tục
+      continue;
+    }
+    WitReadReg(AX, 12);
+    delay(10);
+    while (Serial1.available())
+    {
+      WitSerialDataIn(Serial1.read());
+    }
+    if (s_cDataUpdate)
+    {
+      for (i = 0; i < 3; i++)
+      {
+        fAcc[i] = sReg[AX + i] / 32768.0f * 16.0f;
+        fGyro[i] = sReg[GX + i] / 32768.0f * 2000.0f;
+        fAngle[i] = sReg[Roll + i] / 32768.0f * 180.0f;
+      }
+      if (s_cDataUpdate & ACC_UPDATE)
+      {
+        accel[0] = fAcc[0];
+        accel[1] = fAcc[1];
+        accel[0] = 0.0;
+        s_cDataUpdate &= ~ACC_UPDATE;
+      }
+      if (s_cDataUpdate & GYRO_UPDATE)
+      {
+        gyro_z = fGyro[2] * M_PI / 180.0; // Chuyển sang rad/s
+        s_cDataUpdate &= ~GYRO_UPDATE;
+      }
+      if (s_cDataUpdate & ANGLE_UPDATE)
+      {
+        // Serial.print("angle:");
+        // Serial.print(fAngle[0], 3);
+        // Serial.print(" ");
+        // Serial.print(fAngle[1], 3);
+        // Serial.print(" ");
+        measured_yaw = fAngle[2] * M_PI / 180.0;
+        // Serial.print("\r\n");
+        s_cDataUpdate &= ~ANGLE_UPDATE;
+      }
+
+      s_cDataUpdate = 0;
     }
     else
     {
+      // Nếu không có dữ liệu mới, bỏ qua lần lặp này
+      vTaskDelayUntil(&xLastWakeTime, xFrequency);
       continue;
     }
-    double dt = 0.01;
+    /// Hiển thị dữ liệu cảm biến đọc được (debug)
+    /*
+    Serial.print("dt=");
+    Serial.print(dt, 4);
+    Serial.print(", ax=");
+    Serial.print(accel[0], 3);
+    Serial.print(", ay=");
+    Serial.print(accel[1], 3);
+    Serial.print(", gz=");
+    Serial.print(gyro_z, 3);
+    Serial.print(", yaw=");
+    Serial.println(measured_yaw*180.0/M_PI, 3);*/
 
     if (xSemaphoreTake(stateMutex, (TickType_t)10) == pdTRUE)
     {
       // =================== BƯỚC 1: CẬP NHẬT TRẠNG THÁI DANH NGHĨA (NOMINAL STATE) ===================
       // Sử dụng RK4 để tích hợp IMU vào nominal_state, làm cho nó bị trôi đi một cách tự nhiên.
-      // (Code RK4 giữ nguyên như phiên bản trước, nhưng tác động lên nominal_state)
-      {
-        double ax_raw = accel[0] - nominal_state[5];
-        double ay_raw = accel[1] - nominal_state[6];
-        double gyro_z_raw = gyro_z - nominal_state[7];
 
-        double ax_std_body = -ay_raw;
-        double ay_std_body = ax_raw;
+      double ax_raw = accel[0] - nominal_state[5];
+      double ay_raw = accel[1] - nominal_state[6];
+      double gyro_z_raw = gyro_z - nominal_state[7];
 
-        // 3. Lấy góc heading (yaw) từ state
-        double theta = nominal_state[4];
-        double cos_th = cos(theta);
-        double sin_th = sin(theta);
+      // Chuyển gia tốc từ hệ toạ độ body sang hệ body tiêu chuẩn ( y trước, x phải)
+      double ax_std_body = -ay_raw;
+      double ay_std_body = ax_raw;
 
-        // 4. Xoay gia tốc từ Body tiêu chuẩn sang ENU(East, North)
-        // Chú ý công thức đúng: East ~ Y, North ~ X trong mặt phẳng toán học
-        // double ax_nav_east = ay_std_body * sin_th + ax_std_body * cos_th;
-        // double ay_nav_north = ay_std_body * cos_th - ax_std_body * sin_th;
-        double ax_nav_east = ax_std_body * cos_th - ay_std_body * sin_th;
-        double ay_nav_north = ax_std_body * sin_th + ay_std_body * cos_th;
-
-        double k1[STATE_DIM], k2[STATE_DIM], k3[STATE_DIM], k4[STATE_DIM];
-        double temp_state[STATE_DIM];
-
-        // -- Bước 1: Tính k1 dựa trên trạng thái hiện tại (state)
-        k1[0] = nominal_state[2];
-        k1[1] = nominal_state[3];
-        k1[2] = ax_nav_east;
-        k1[3] = ay_nav_north;
-        k1[4] = gyro_z_raw;
-        k1[5] = 0; // Đạo hàm của bias là 0
-        k1[6] = 0;
-        k1[7] = 0;
-
-        // -- Bước 2: Tính k2 dựa trên trạng thái ở điểm giữa (sử dụng k1)
-        for (int i = 0; i < STATE_DIM; ++i)
-          temp_state[i] = nominal_state[i] + 0.5 * dt * k1[i];
-        cos_th = cos(temp_state[4]);
-        sin_th = sin(temp_state[4]);
-        ax_nav_east = ax_std_body * cos_th - ay_std_body * sin_th;
-        ay_nav_north = ax_std_body * sin_th + ay_std_body * cos_th;
-        k2[0] = temp_state[2];
-        k2[1] = temp_state[3];
-        k2[2] = ax_nav_east;
-        k2[3] = ay_nav_north;
-        k2[4] = gyro_z_raw;
-        for (int i = 5; i < STATE_DIM; ++i)
-          k2[i] = 0;
-
-        // -- Bước 3: Tính k3 dựa trên trạng thái ở điểm giữa (sử dụng k2)
-        for (int i = 0; i < STATE_DIM; ++i)
-          temp_state[i] = nominal_state[i] + 0.5 * dt * k2[i];
-        cos_th = cos(temp_state[4]);
-        sin_th = sin(temp_state[4]);
-        ax_nav_east = ax_std_body * cos_th - ay_std_body * sin_th;
-        ay_nav_north = ax_std_body * sin_th + ay_std_body * cos_th;
-        k3[0] = temp_state[2];
-        k3[1] = temp_state[3];
-        k3[2] = ax_nav_east;
-        k3[3] = ay_nav_north;
-        k3[4] = gyro_z_raw;
-        for (int i = 5; i < STATE_DIM; ++i)
-          k3[i] = 0;
-
-        // -- Bước 4: Tính k4 dựa trên trạng thái ở điểm cuối (sử dụng k3)
-        for (int i = 0; i < STATE_DIM; ++i)
-          temp_state[i] = nominal_state[i] + dt * k3[i];
-        cos_th = cos(temp_state[4]);
-        sin_th = sin(temp_state[4]);
-        ax_nav_east = ax_std_body * cos_th - ay_std_body * sin_th;
-        ay_nav_north = ax_std_body * sin_th + ay_std_body * cos_th;
-        k4[0] = temp_state[2];
-        k4[1] = temp_state[3];
-        k4[2] = ax_nav_east;
-        k4[3] = ay_nav_north;
-        k4[4] = gyro_z_raw;
-        for (int i = 5; i < STATE_DIM; ++i)
-          k4[i] = 0;
-
-        // Bước 4: Cập nhật trạng thái
-        for (int i = 0; i < STATE_DIM; i++)
-        {
-          nominal_state[i] += dt * k2[i];
-        }
-
-        // Chuẩn hóa lại góc theta
-        nominal_state[4] = normalizeAngle(nominal_state[4]);
-
-        xSemaphoreGive(stateMutex);
-      }
-
-      // =================== BƯỚC 2: CẬP NHẬT HIỆP PHƯƠNG SAI LỖI (ERROR STATE COVARIANCE) ===================
-      // P_k = F * P_{k-1} * F^T + Q
-      // Chúng ta cần tính ma trận chuyển trạng thái lỗi F
-
-      double F[STATE_DIM * STATE_DIM] = {0};
       double theta = nominal_state[4];
       double cos_th = cos(theta);
       double sin_th = sin(theta);
 
-      // Gia tốc đã hiệu chỉnh bias trong hệ body
-      double corrected_ax_raw = accel[0] - nominal_state[5];
-      double corrected_ay_raw = accel[1] - nominal_state[6];
-      double ax_std_body = -corrected_ay_raw;
-      double ay_std_body = corrected_ax_raw;
+      double forward_accel = ay_std_body;
 
-      // Xây dựng ma trận F ≈ I + A*dt
+      // Serial.print(forward_accel, 4);
+      // forward_accel = 0.0;
+      double ax_nav_east = forward_accel * cos_th;
+      double ay_nav_north = forward_accel * sin_th;
+      // Serial.print("ax_nav_east=");
+      // Serial.print(ax_nav_east, 3);
+      // Serial.print("  ay_nav_north=");
+      // Serial.print(ay_nav_north, 3);
+      double k1[STATE_DIM], k2[STATE_DIM], k3[STATE_DIM], k4[STATE_DIM];
+
+      // -- Tính k1
+      k1[0] = nominal_state[2];
+      k1[1] = nominal_state[3];
+      k1[2] = ax_nav_east;
+      k1[3] = ay_nav_north;
+      k1[4] = gyro_z_raw;
+      k1[5] = 0;
+      k1[6] = 0;
+      k1[7] = 0;
+
+      // --Tính k2
+      double theta_k2 = nominal_state[4] + 0.5 * dt * k1[4];
+      k2[0] = nominal_state[2] + 0.5 * dt * k1[2];
+      k2[1] = nominal_state[3] + 0.5 * dt * k1[3];
+      k2[2] = forward_accel * cos(theta_k2); // Vẫn dùng forward_accel
+      k2[3] = forward_accel * sin(theta_k2); // Vẫn dùng forward_accel
+      k2[4] = gyro_z_raw;
+      for (int i = 5; i < STATE_DIM; ++i)
+        k2[i] = 0;
+
+      // -- Tính k3
+      double theta_k3 = nominal_state[4] + 0.5 * dt * k2[4];
+      k3[0] = nominal_state[2] + 0.5 * dt * k2[2];
+      k3[1] = nominal_state[3] + 0.5 * dt * k2[3];
+      k3[2] = forward_accel * cos(theta_k3);
+      k3[3] = forward_accel * sin(theta_k3);
+      k3[4] = gyro_z_raw;
+      for (int i = 5; i < STATE_DIM; ++i)
+        k3[i] = 0;
+
+      // -- Tính k4
+      double theta_k4 = nominal_state[4] + dt * k3[4];
+      k4[0] = nominal_state[2] + dt * k3[2];
+      k4[1] = nominal_state[3] + dt * k3[3];
+      k4[2] = forward_accel * cos(theta_k4);
+      k4[3] = forward_accel * sin(theta_k4);
+      k4[4] = gyro_z_raw;
+      for (int i = 5; i < STATE_DIM; ++i)
+        k4[i] = 0;
+
+      // Cập nhật trạng thái
+      for (int i = 0; i < STATE_DIM; i++)
+      {
+        nominal_state[i] += (dt / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
+      }
+      nominal_state[4] = normalizeAngle(nominal_state[4]);
+
+      // =================== BƯỚC 2: CẬP NHẬT HIỆP PHƯƠNG SAI LỖI (ERROR STATE COVARIANCE) ===================
+      double F[STATE_DIM * STATE_DIM] = {0};
+      double theta_pred = nominal_state[4];
+      double cos_th_pred = cos(theta_pred);
+      double sin_th_pred = sin(theta_pred);
+
+      ax_raw = accel[0] - nominal_state[5];
+      ay_std_body = ax_raw; // Chỉ dùng gia tốc dọc
+
       for (int i = 0; i < STATE_DIM; ++i)
-        F[i * STATE_DIM + i] = 1.0; // Bắt đầu với ma trận đơn vị I
+        F[i * STATE_DIM + i] = 1.0;
 
-      F[0 * STATE_DIM + 2] = dt; // d(p_e)/d(v_e)
-      F[1 * STATE_DIM + 3] = dt; // d(p_n)/d(v_n)
+      F[0 * STATE_DIM + 2] = dt;
+      F[1 * STATE_DIM + 3] = dt;
 
-      // d(v_e)/d(theta)
-      F[2 * STATE_DIM + 4] = (-ax_std_body * sin_th - ay_std_body * cos_th) * dt;
-      // d(v_e)/d(b_ax)
-      F[2 * STATE_DIM + 5] = (sin_th)*dt; // d(v_e)/d(b_ay) = d(v_e)/d(ax_std) * d(ax_std)/d(bay) = -cos(th) * -1
-      // d(v_e)/d(b_ay)
-      F[2 * STATE_DIM + 6] = (-cos_th) * dt;
+      // Đạo hàm theo theta (state 4)
+      F[2 * STATE_DIM + 4] = (-ay_std_body * sin_th_pred) * dt;
+      F[3 * STATE_DIM + 4] = (ay_std_body * cos_th_pred) * dt;
 
-      // d(v_n)/d(theta)
-      F[3 * STATE_DIM + 4] = (ax_std_body * cos_th - ay_std_body * sin_th) * dt;
-      // d(v_n)/d(b_ax)
-      F[3 * STATE_DIM + 5] = (-cos_th) * dt;
-      // d(v_n)/d(b_ay)
-      F[3 * STATE_DIM + 6] = (-sin_th) * dt;
+      // Đạo hàm theo bias_ax (state 5)
+      F[2 * STATE_DIM + 5] = -(-sin_th_pred) * dt; // = sin_th_pred * dt
+      F[3 * STATE_DIM + 5] = (-cos_th_pred) * dt;  // = -cos_th_pred * dt
 
-      F[4 * STATE_DIM + 7] = -dt; // d(theta)/d(b_gz)
+      // Đạo hàm theo bias_ay (state 6)
+      F[2 * STATE_DIM + 6] = -sin_th_pred * dt;
+      F[3 * STATE_DIM + 6] = cos_th_pred * dt;
 
-      // Cập nhật P: P = F * P * F^T
+      F[4 * STATE_DIM + 7] = -dt;
+
       double FP[STATE_DIM * STATE_DIM] = {0};
-      // FP = F * P
       for (int i = 0; i < STATE_DIM; i++)
       {
         for (int j = 0; j < STATE_DIM; j++)
@@ -322,7 +399,7 @@ void predictionTask(void *pvParameters)
           }
         }
       }
-      // P = FP * F^T + Q
+
       for (int i = 0; i < STATE_DIM; i++)
       {
         for (int j = 0; j < STATE_DIM; j++)
@@ -330,12 +407,72 @@ void predictionTask(void *pvParameters)
           double temp = 0;
           for (int k = 0; k < STATE_DIM; k++)
           {
-            temp += FP[i * STATE_DIM + k] * F[j * STATE_DIM + k]; // F^T(k,j) = F(j,k)
+            temp += FP[i * STATE_DIM + k] * F[j * STATE_DIM + k];
           }
-          P[i * STATE_DIM + j] = temp + Q[i * STATE_DIM + j];
+          // Thêm nhiễu quá trình Q * dt
+          P[i * STATE_DIM + j] = temp + Q[i * STATE_DIM + j] * dt;
         }
       }
+      // =================== BƯỚC 3 (MỚI): MINI-UPDATE DÙNG IMU YAW ===================
+      prediction_counter++;
+      if (prediction_counter % 10 == 0) // Thực hiện ở tần số 10Hz (100Hz / 10)
+      {
+        // Ma trận H cho phép đo yaw (1x8)
+        // H_yaw = [0, 0, 0, 0, 1, 0, 0, 0]
 
+        // S_yaw = H_yaw * P * H_yaw^T + R_yaw  (S là số vô hướng 1x1)
+        double S_yaw = P[4 * STATE_DIM + 4] + R_yaw;
+
+        // K_yaw = P * H_yaw^T * S_yaw_inv (K là véc-tơ 8x1)
+        double K_yaw[STATE_DIM];
+        for (int i = 0; i < STATE_DIM; i++)
+        {
+          K_yaw[i] = P[i * STATE_DIM + 4] / S_yaw;
+        }
+
+        // innovation_yaw = measured_yaw - state[4]
+        // QUAN TRỌNG: Phải chuẩn hóa sai số góc để xử lý việc vượt qua mốc -180/180
+        double innovation_yaw = normalizeAngle(measured_yaw - nominal_state[4]);
+
+        // Cập nhật trạng thái: state = state + K * innovation
+        for (int i = 0; i < STATE_DIM; i++)
+        {
+          nominal_state[i] += K_yaw[i] * innovation_yaw;
+        }
+        nominal_state[4] = normalizeAngle(nominal_state[4]); // Chuẩn hóa lại góc sau khi cập nhật
+
+        // Cập nhật hiệp phương sai: P = (I - K * H) * P
+        double I_KH[STATE_DIM * STATE_DIM];
+        for (int i = 0; i < STATE_DIM; i++)
+        {
+          for (int j = 0; j < STATE_DIM; j++)
+          {
+            // H_yaw chỉ có phần tử thứ 4 là khác 0
+            double kh_ij = K_yaw[i] * ((j == 4) ? 1.0 : 0.0);
+            I_KH[i * STATE_DIM + j] = ((i == j) ? 1.0 : 0.0) - kh_ij;
+          }
+        }
+
+        double P_new[STATE_DIM * STATE_DIM] = {0};
+        for (int i = 0; i < STATE_DIM; i++)
+        {
+          for (int j = 0; j < STATE_DIM; j++)
+          {
+            for (int k = 0; k < STATE_DIM; k++)
+            {
+              P_new[i * STATE_DIM + j] += I_KH[i * STATE_DIM + k] * P[k * STATE_DIM + j];
+            }
+          }
+        }
+        memcpy(P, P_new, sizeof(P_new));
+      }
+      // Sau mỗi bước, in ra state
+      // Serial.print("x=");
+      // Serial.print(nominal_state[0], 3);
+      // Serial.print("  y=");
+      // Serial.print(nominal_state[1], 3);
+      // Serial.print("  yaw=");
+      // Serial.println(nominal_state[4] * 180.0 / M_PI, 2);
       xSemaphoreGive(stateMutex);
     }
     vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -344,95 +481,133 @@ void predictionTask(void *pvParameters)
 
 void updateTask(void *pvParameters)
 {
-  const TickType_t xFrequency = 1000 / portTICK_PERIOD_MS; // 1Hz
+  const TickType_t xFrequency = 10 / portTICK_PERIOD_MS; // 100Hz
   TickType_t xLastWakeTime = xTaskGetTickCount();
   uint8_t rtksta = 0;
+  uint32_t hAcc = 0;
+  PointECEF tempECEF;
+  PointECEF tempECEF_2;
   while (1)
   {
-    bool gnss_data_valid = false;
-    double z[2] = {0, 0}; // Vẫn là [current_east, current_north]
+    bool NAVHPPOSECEF = false;
+    bool PVT = false;
 
+    double z[2] = {0, 0}; // Vẫn là [current_east, current_north]
+    tempECEF.x = 0;
+    tempECEF.y = 0;
+    tempECEF.z = 0;
+    // if (myGNSS.getNAVHPPOSECEF())
     if (myGNSS.getPVT())
     {
-      rtksta = myGNSS.getCarrierSolutionType();
+      // rtksta = myGNSS.getCarrierSolutionType();
       PointLLH tempLLH;
-      PointECEF tempECEF;
 
       // Lấy tọa độ và chuyển sang hệ ECEF
-      GetRTK(tempLLH);
-      llhToEcef(tempLLH, tempECEF);
+      // GetRTK(tempLLH);
+      // Serial.print(tempLLH.latitude, 9);
+      // Serial.print(", ");
+      // Serial.print(tempLLH.longitude, 9);
+      // Serial.print(", ");
+      // llhToEcef(tempLLH, tempECEF_2);
+      // First, let's collect the position data
+      int32_t ECEFX = myGNSS.getHighResECEFX();
+      int8_t ECEFXHp = myGNSS.getHighResECEFXHp();
+      int32_t ECEFY = myGNSS.getHighResECEFY();
+      int8_t ECEFYHp = myGNSS.getHighResECEFYHp();
+      int32_t ECEFZ = myGNSS.getHighResECEFZ();
+      int8_t ECEFZHp = myGNSS.getHighResECEFZHp();
+      uint32_t accuracy = myGNSS.getPositionAccuracy();
+
+      // Defines storage for the ECEF coordinates as double
+      double d_ECEFX;
+      double d_ECEFY;
+      double d_ECEFZ;
+
+      // Assemble the high precision coordinates
+      d_ECEFX = ((double)ECEFX) / 100.0;      // Convert from cm to m
+      d_ECEFX += ((double)ECEFXHp) / 10000.0; // Now add the high resolution component ( mm * 10^-1 = m * 10^-4 )
+      d_ECEFY = ((double)ECEFY) / 100.0;      // Convert from cm to m
+      d_ECEFY += ((double)ECEFYHp) / 10000.0; // Now add the high resolution component ( mm * 10^-1 = m * 10^-4 )
+      d_ECEFZ = ((double)ECEFZ) / 100.0;      // Convert from cm to m
+      d_ECEFZ += ((double)ECEFZHp) / 10000.0; // Now add the high resolution component ( mm * 10^-1 = m * 10^-4 )
+
+      tempECEF.x = d_ECEFX;
+      tempECEF.y = d_ECEFY;
+      tempECEF.z = d_ECEFZ;
 
       // BƯỚC 2: Chuyển đổi tọa độ ECEF vừa nhận được sang ENU
       double current_east, current_north, current_up;
       ecefToEnu(tempECEF, current_east, current_north, current_up);
-
+      // double current_east_2, current_north_2, current_up_2;
+      // ecefToEnu(tempECEF_2, current_east_2, current_north_2, current_up_2);
       z[0] = current_east;
       z[1] = current_north;
 
       //*********DEBUG***********//
-      Serial.print(current_east);
-      Serial.print(", ");
-      Serial.print(current_north);
-      Serial.print(", ");
+      // Serial.print(current_east_2,4);
+      // Serial.print(", ");
+      // Serial.print(current_north_2,4);
+      // Serial.print(" | ");
+      // Serial.print(current_east, 4);
+      // Serial.print(", ");
+      // Serial.print(current_north, 4);
+      // Serial.print(", ");
+      // Serial.print(sqrt((tempECEF.x - enu_origin_ecef.x) * (tempECEF.x - enu_origin_ecef.x) + (tempECEF.y - enu_origin_ecef.y) * (tempECEF.y - enu_origin_ecef.y)));
+      // Serial.print(", ");
       //*********DEBUG***********//
 
-      gnss_data_valid = true; // Đánh dấu đã có dữ liệu hợp lệ
+      
+      rtksta = myGNSS.getCarrierSolutionType();
+      hAcc = myGNSS.getHorizontalAccEst(); // mm
+      NAVHPPOSECEF = true;                 // Đánh dấu đã có dữ liệu hợp lệ
+      // PVT = true;
     }
 
-    if (gnss_data_valid)
+    // if (myGNSS.getPVT() && (myGNSS.getInvalidLlh() == false))
+    // {
+    //   rtksta = myGNSS.getCarrierSolutionType();
+    //   hAcc = myGNSS.getHorizontalAccEst(); // mm
+    //   PVT = true;
+    // }
+
+    if (NAVHPPOSECEF)
     {
       if (xSemaphoreTake(stateMutex, (TickType_t)10) == pdTRUE)
       {
-        Serial.print("Prediction: state[0]=");
-        Serial.print(nominal_state[0], 6);
-        Serial.print(", state[1]=");
-        Serial.print(nominal_state[1], 6);
+        Serial.print(z[0]);
+        Serial.print(",");
+        Serial.print(z[1]);
+        Serial.print(",  ");
+
+        // Serial.print("Pred");
+        Serial.print(nominal_state[0], 4);
+        Serial.print(",");
+        Serial.print(nominal_state[1], 4);
+        Serial.print(" , ");
+        Serial.print(degrees(nominal_state[4]), 4);
         Serial.print(" , ");
 
         // =================== BƯỚC 3: TÍNH TOÁN HIỆU CHỈNH LỖI ===================
 
-        // Innovation: Sai số giữa phép đo GPS và trạng thái danh nghĩa
-        double innovation[2] = {z[0] - nominal_state[0], z[1] - nominal_state[1]};
-
         // Ma trận H cho trạng thái lỗi vẫn như cũ
-        double H[2 * STATE_DIM] = {0};
+        static double H[2 * STATE_DIM] = {0};
         H[0 * STATE_DIM + 0] = 1.0; // d(z_e)/d(δp_e)
         H[1 * STATE_DIM + 1] = 1.0; // d(z_n)/d(δp_n)
 
         // =================== BẮT ĐẦU ADAPTIVE R ===================
-        double R_local[2 * 2]; // Khai báo R_local là biến cục bộ trong task
-
-        switch (rtksta)
-        {
-        case 2: // RTK Fixed - Độ chính xác cao nhất
-          // Giả định độ lệch chuẩn ~2cm -> phương sai = 0.02*0.02 = 0.0004
-          R_local[0] = 0.0004;
-          R_local[1] = 0;
-          R_local[2] = 0;
-          R_local[3] = 0.0004;
-          break;
-
-        case 1: // RTK Float - Độ chính xác trung bình
-          // Giả định độ lệch chuẩn ~30cm -> phương sai = 0.3*0.3 = 0.09
-          R_local[0] = 0.09;
-          R_local[1] = 0;
-          R_local[2] = 0;
-          R_local[3] = 0.09;
-          break;
-
-        default: // Trường hợp khác (No RTK, Standard GPS) - Độ chính xác thấp
-          // Giả định độ lệch chuẩn ~1.5m -> phương sai = 1.5*1.5 = 2.25
-          R_local[0] = 2.25;
-          R_local[1] = 0;
-          R_local[2] = 0;
-          R_local[3] = 2.25;
-          break;
-        }
+        double sigma = (double)hAcc / 1000.0; // hAcc từ mm sang m
+        static double R_local[4] = {0};
+        Serial.print(hAcc);
+        Serial.print(", ");
+        R_local[0] = sigma * sigma; // phương sai East
+        R_local[3] = sigma * sigma; // phương sai North
+        // Serial.print(R_local[0], 5);
+        // Serial.print(", ");
         // =================== KẾT THÚC ADAPTIVE R ===================
 
         // =================== TÍNH TOÁN TỐI ƯU ===================
         // --- BƯỚC 1: TÍNH S = H*P*H^T + R ---
-        double S[4];
+        static double S[4];
         S[0] = P[0 * STATE_DIM + 0] + R_local[0]; // S(0,0)
         S[1] = P[0 * STATE_DIM + 1] + R_local[1]; // S(0,1)
         S[2] = P[1 * STATE_DIM + 0] + R_local[2]; // S(1,0)
@@ -453,13 +628,13 @@ void updateTask(void *pvParameters)
         else
         {
           // 3a. Tính S_inv (kích thước 2x2)
-          double S_inv[4];
+          static double S_inv[4];
           S_inv[0] = S[3] / detS;
           S_inv[1] = -S[1] / detS;
           S_inv[2] = -S[2] / detS;
           S_inv[3] = S[0] / detS;
 
-          double K[STATE_DIM * 2];
+          static double K[STATE_DIM * 2];
           for (int i = 0; i < STATE_DIM; i++)
           {
             double p_i0 = P[i * STATE_DIM + 0];
@@ -470,31 +645,28 @@ void updateTask(void *pvParameters)
 
           // --- BƯỚC 3: CẬP NHẬT TRẠNG THÁI ---
           double innovation[2] = {z[0] - nominal_state[0], z[1] - nominal_state[1]};
-          for (int i = 0; i < STATE_DIM; i++)
-          {
-            nominal_state[i] += K[i * 2 + 0] * innovation[0] + K[i * 2 + 1] * innovation[1];
-          }
 
-          // Tính toán véc-tơ hiệu chỉnh lỗi tối ưu (δx)
+          // // d_squared = innovation' * S_inv * innovation
+          // double d_squared = S_inv[0] * innovation[0] * innovation[0] +
+          //                    (S_inv[1] + S_inv[2]) * innovation[0] * innovation[1] +
+          //                    S_inv[3] * innovation[1] * innovation[1];
+
+          // const double CHI_SQUARED_THRESHOLD = 5.991; // Ngưỡng 95% cho 2 bậc tự do
+
+          // if (d_squared > CHI_SQUARED_THRESHOLD)
+          // {
+          //   Serial.println("Outlier detected by Chi-Squared test! Skipping update.");
+          //   xSemaphoreGive(stateMutex);
+          //   // vTaskDelayUntil(&xLastWakeTime, xFrequency);
+          //   continue;
+          // }
+          // Tính toán véc-tơ hiệu chỉnh lỗi (δx = K * innovation)
           double error_state_correction[STATE_DIM] = {0};
           // error_state_correction = K * innovation
           for (int i = 0; i < STATE_DIM; i++)
           {
             error_state_correction[i] = K[i * 2 + 0] * innovation[0] + K[i * 2 + 1] * innovation[1];
           }
-
-          // --- BƯỚC 4: CẬP NHẬT HIỆP PHƯƠNG SAI P = (I - K*H)*P ---
-          // Đây là cách tính (I - K*H)*P hiệu quả nhất
-          double P_new[STATE_DIM * STATE_DIM];
-          for (int i = 0; i < STATE_DIM; i++)
-          {
-            for (int j = 0; j < STATE_DIM; j++)
-            {
-              double kh_ij = K[i * 2 + 0] * P[0 * STATE_DIM + j] + K[i * 2 + 1] * P[1 * STATE_DIM + j];
-              P_new[i * STATE_DIM + j] = P[i * STATE_DIM + j] - kh_ij;
-            }
-          }
-          memcpy(P, P_new, sizeof(P_new));
 
           // =================== BƯỚC 4: TIÊM LỖI VÀ RESET ===================
 
@@ -506,15 +678,29 @@ void updateTask(void *pvParameters)
           // Chuẩn hóa lại góc sau khi hiệu chỉnh
           nominal_state[4] = normalizeAngle(nominal_state[4]);
 
+          // Đây là cách tính (I - K*H)*P hiệu quả nhất
+          static double P_new[STATE_DIM * STATE_DIM];
+          for (int i = 0; i < STATE_DIM; i++)
+          {
+            for (int j = 0; j < STATE_DIM; j++)
+            {
+              double kh_ij = K[i * 2 + 0] * P[0 * STATE_DIM + j] + K[i * 2 + 1] * P[1 * STATE_DIM + j];
+              P_new[i * STATE_DIM + j] = P[i * STATE_DIM + j] - kh_ij;
+            }
+          }
+          memcpy(P, P_new, sizeof(P_new));
+
           // Trạng thái lỗi đã được "tiêu thụ" và được reset về 0 cho vòng lặp tiếp theo.
           // Hiệp phương sai P đã được cập nhật để phản ánh sự không chắc chắn mới.
           Serial.print(rtksta);
-          Serial.print(",");
+          Serial.print(", ");
           Serial.print(nominal_state[0], 4);
           Serial.print(",");
           Serial.print(nominal_state[1], 4);
           Serial.print(",");
-          Serial.println(nominal_state[4], 4);
+          Serial.print(nominal_state[4], 4);
+          Serial.print(",");
+          Serial.println(nominal_state[4] * 180 / M_PI, 4);
           xSemaphoreGive(stateMutex);
         }
       }
@@ -523,36 +709,87 @@ void updateTask(void *pvParameters)
   }
 }
 
+static void SensorUartSend(uint8_t *p_data, uint32_t uiSize);
+static void CopeSensorData(uint32_t uiReg, uint32_t uiRegNum);
+static void Delayms(uint16_t ucMs);
+
+static void SensorUartSend(uint8_t *p_data, uint32_t uiSize)
+{
+  Serial1.write(p_data, uiSize);
+  Serial1.flush();
+}
+
+static void CopeSensorData(uint32_t uiReg, uint32_t uiRegNum)
+{
+  int i;
+  for (i = 0; i < uiRegNum; i++)
+  {
+    switch (uiReg)
+    {
+    case AZ:
+      s_cDataUpdate |= ACC_UPDATE;
+      break;
+    case GZ:
+      s_cDataUpdate |= GYRO_UPDATE;
+      break;
+    case HZ:
+      s_cDataUpdate |= MAG_UPDATE;
+      break;
+    case Yaw:
+      s_cDataUpdate |= ANGLE_UPDATE;
+      break;
+    default:
+      s_cDataUpdate |= READ_UPDATE;
+      break;
+    }
+    uiReg++;
+  }
+}
+
+static void Delayms(uint16_t ucMs)
+{
+  delay(ucMs);
+}
+
 void setup()
 {
   setCpuFrequencyMhz(240);
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("SparkFun u-blox Example");
-  RS485.begin(115200, SERIAL_8N1, RXD2, TXD2);
-  delay(500);
-  node.begin(SENSOR_SLAVE_ID, RS485);
-  delay(500);
-  WiFi.mode(WIFI_STA);
   delay(500);
 
+  Serial.begin(115200);
+  delay(500);
+
+  Serial1.begin(115200, SERIAL_8N1, RXD2, TXD2);
+  delay(500);
+
+  WitInit(WIT_PROTOCOL_MODBUS, 0x50);
+  WitSerialWriteRegister(SensorUartSend);
+  WitRegisterCallBack(CopeSensorData);
+  WitDelayMsRegister(Delayms);
+  // WitSetHeadingtoZero();
+
+  // WiFi.mode(WIFI_STA);
+  // delay(500);
+
   // Init ESP-NOW
-  if (esp_now_init() != ESP_OK)
-  {
-    Serial.println("Error initializing ESP-NOW");
-    return;
-  }
-  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-  if (esp_now_add_peer(&peerInfo) != ESP_OK)
-  {
-    Serial.println("Failed to add peer");
-    return;
-  }
+  // if (esp_now_init() != ESP_OK)
+  // {
+  //   Serial.println("Error initializing ESP-NOW");
+  //   return;
+  // }
+  // Serial.println("222222");
+  // memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  // peerInfo.channel = 0;
+  // peerInfo.encrypt = false;
+  // if (esp_now_add_peer(&peerInfo) != ESP_OK)
+  // {
+  //   Serial.println("Failed to add peer");
+  //   return;
+  // }
 
   Wire.begin(21, 22);
   delay(500);
+
   if (myGNSS.begin(Wire, 0x42) == false)
   {
     Serial.println(F("u-blox GNSS not detected. Freezing."));
@@ -562,39 +799,50 @@ void setup()
 
   stateMutex = xSemaphoreCreateMutex();
 
+  myGNSS.setI2COutput(COM_TYPE_UBX);
+
+  // sensor.setCalibrationCommand(SET_HEADING_ANGLE_TO_ZERO);
   // Chờ RTK đạt mức Fixed (fix type = 3)
   Serial.println("Waiting for RTK Fixed solution...");
   while (true)
   {
+    // Serial.println(sensor.getAttitudeValues().yaw);
+    uint8_t fixType = 0;
+    uint8_t carrierSolution = 0;
     if (myGNSS.getPVT())
     {
-      uint8_t fixType = myGNSS.getFixType();
-      uint8_t carrierSolution = myGNSS.getCarrierSolutionType();
+      fixType = myGNSS.getFixType();
+      carrierSolution = myGNSS.getCarrierSolutionType();
       Serial.print("Fix Type: ");
       Serial.print(fixType);
       Serial.print(", Carrier Solution: ");
       Serial.println(carrierSolution);
-      if (fixType >= 3 && carrierSolution >= 1)
-      { // RTK Fixed
-        Serial.println("RTK Fixed acquired.");
-        break;
-      }
+
+      GetRTK(initialLLH);
+      // Thiết lập gốc ENU
+      CalculateEnuMatrix(initialLLH);
     }
+    if (myGNSS.getNAVHPPOSECEF())
+    {
+      enu_origin_ecef.x = ((double)myGNSS.getHighResECEFX() / 100.0) + ((double)myGNSS.getHighResECEFXHp() / 10000.0);
+      enu_origin_ecef.y = ((double)myGNSS.getHighResECEFY() / 100.0) + ((double)myGNSS.getHighResECEFYHp() / 10000.0);
+      enu_origin_ecef.z = ((double)myGNSS.getHighResECEFZ() / 100.0) + ((double)myGNSS.getHighResECEFZHp() / 10000.0);
+      Serial.print("ENU Origin ECEF: ");
+      Serial.print(enu_origin_ecef.x, 4);
+      Serial.print(", ");
+      Serial.print(enu_origin_ecef.y, 4);
+      Serial.print(", ");
+      Serial.println(enu_origin_ecef.z, 4);
+    }
+    if (fixType >= 3 && carrierSolution >= 1)
+    { // RTK Fixed
+      Serial.println("RTK Fixed acquired.");
+      break;
+    }
+
     delay(100);
   }
 
-  // Lấy vị trí ban đầu từ RTK
-  PointLLH initialLLH;
-  PointECEF initialECEF;
-  GetRTK(initialLLH);
-  llhToEcef(initialLLH, initialECEF);
-  // Thiết lập gốc ENU
-  setupEnuOrigin(initialLLH, initialECEF);
-
-  // state[0] = initialECEF.x; // x ban đầu
-  // state[1] = initialECEF.y; // y ban đầu
-  // prev_rtk_pos[0] = initialECEF.x;
-  // prev_rtk_pos[1] = initialECEF.y;
   nominal_state[0] = 0.0; // x ban đầu
   nominal_state[1] = 0.0; // y ban đầu
   // prev_rtk_pos[0] = initialECEF.x;
@@ -607,16 +855,40 @@ void setup()
   nominal_state[2] = 0.0; // v_x = 0
   nominal_state[3] = 0.0; // v_y = 0
   // Lấy heading ban đầu từ WTGAHRS3
-  AttitudeData initialHeading = sensor.getAttitudeValues(); // Giả sử hàm này trả về độ (-180 đến 180)
-  if (initialHeading.isDataValid != 0)
-  {                                                       // Kiểm tra dữ liệu hợp lệ
-    nominal_state[4] = initialHeading.yaw * M_PI / 180.0; // Chuyển sang radian
+  // AttitudeData initialHeading = sensor.getAttitudeValues(); // Giả sử hàm này trả về độ (-180 đến 180)
+  WitReadReg(AX, 12);
+  delay(10);
+  while (Serial1.available())
+  {
+    WitSerialDataIn(Serial1.read());
+  }
+
+  if (s_cDataUpdate)
+  {
+    for (i = 0; i < 3; i++)
+    {
+      fAcc[i] = sReg[AX + i] / 32768.0f * 16.0f;
+      fGyro[i] = sReg[GX + i] / 32768.0f * 2000.0f;
+      fAngle[i] = sReg[Roll + i] / 32768.0f * 180.0f;
+    }
+    if (s_cDataUpdate & ANGLE_UPDATE)
+    {
+      nominal_state[4] = fAngle[2];
+      s_cDataUpdate &= ~ANGLE_UPDATE;
+    }
+    s_cDataUpdate = 0;
   }
   else
   {
     nominal_state[4] = 0; // Mặc định 0 nếu không đọc được
     Serial.println("Warning: Initial heading not available, set to 0.");
   }
+
+  // if (initialHeading.isDataValid != 0)
+  // {                                                       // Kiểm tra dữ liệu hợp lệ
+  //   nominal_state[4] = initialHeading.yaw * M_PI / 180.0; // Chuyển sang radian
+  // }
+
   Serial.print("Initial Heading (rad): ");
   Serial.println(nominal_state[4]);
   nominal_state[5] = 0; // b_ax = 0
@@ -629,6 +901,8 @@ void setup()
     while (1)
       ; // Treo hệ thống
   }
+  double yaw_measurement_std_dev_rad = 0.1 * M_PI / 180.0;
+  R_yaw = yaw_measurement_std_dev_rad * yaw_measurement_std_dev_rad;
 
   // =================== BỘ THAM SỐ ĐỀ XUẤT ===================
   // Khởi tạo P - Mức độ không chắc chắn BAN ĐẦU
@@ -642,9 +916,9 @@ void setup()
   P[7 * STATE_DIM + 7] = (0.5 * M_PI / 180.0) * (0.5 * M_PI / 180.0); // Không chắc chắn về bias gyro ban đầu (0.5 deg/s)
 
   // Khởi tạo Q - Mức độ nhiễu của quá trình THEO THỜI GIAN
-  double vel_noise_std_dev = 0.05;        // Giả định vận tốc có thể nhiễu ngẫu nhiên 5 cm/s
-  double accel_bias_noise_std_dev = 0.01; // Giả định bias gia tốc RẤT ỔN ĐỊNH, ít thay đổi
-  double gyro_bias_noise_std_dev = 0.001; // Giả định bias gyro CỰC KỲ ỔN ĐỊNH
+  double vel_noise_std_dev = 0.05;             // Giả định vận tốc có thể nhiễu ngẫu nhiên 5 cm/s
+  double accel_bias_noise_std_dev = 0.0026999; // Giả định bias gia tốc RẤT ỔN ĐỊNH, ít thay đổi
+  double gyro_bias_noise_std_dev = 0.01994;   // Giả định bias gyro CỰC KỲ ỔN ĐỊNH
 
   Q[2 * STATE_DIM + 2] = vel_noise_std_dev * vel_noise_std_dev;
   Q[3 * STATE_DIM + 3] = vel_noise_std_dev * vel_noise_std_dev;
