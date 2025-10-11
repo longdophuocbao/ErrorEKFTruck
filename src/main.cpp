@@ -235,11 +235,11 @@ public:
                      adaptive_dk * R_estimated;
 
       // Debug
-      // if (update_count % 200 == 0 && i == 0)
-      // {
-      //   Serial.printf("SageHusa-R[%d]: innov²=%.4f, HPH=%.4f, Rest=%.4f, R=%.4f\n",
-      //                 i, innovation_cov, HPH, R_estimated, R[i * 5 + i]);
-      // }
+      if (update_count % 200 == 0 && i == 0)
+      {
+        Serial.printf("SageHusa-R[%d]: innov²=%.4f, HPH=%.4f, Rest=%.4f, R=%.4f\n",
+                      i, innovation_cov, HPH, R_estimated, R[i * 5 + i]);
+      }
     }
   }
 
@@ -525,7 +525,7 @@ esekf_float_t gocIMU = 0.0f;
 #define MAG_UPDATE 0x08
 #define READ_UPDATE 0x80
 static volatile char s_cDataUpdate = 0, s_cCmd = 0xff;
-
+ESKF_STATE_DATA eskf_data;
 // --- PREDICTION TASK (FLOAT INTERNAL) ---
 void predictionTask(void *pvParameters)
 {
@@ -599,6 +599,11 @@ void predictionTask(void *pvParameters)
       esekf_float_t ax_raw = accel[0] - error_state[6];
       esekf_float_t ay_raw = accel[1] - error_state[7];
       esekf_float_t gyro_z_raw = gyro_z - error_state[5];
+
+      eskf_data.raw_data[0] = accel[0]; // ax
+      eskf_data.raw_data[1] = accel[1]; // ay
+      eskf_data.raw_data[2] = gocIMU;   // yaw IMU (độ)
+      eskf_data.raw_data[3] = gyro_z;   // gz (rad/s)
 
       esekf_float_t ax_std_body = -ay_raw;
       esekf_float_t ay_std_body = ax_raw;
@@ -706,6 +711,37 @@ void predictionTask(void *pvParameters)
 
       // LƯU MATRICES CHO SAGE-HUSA
       sage_husa_filter.savePredictionMatrices(F_current, P);
+
+      // =================== IMU YAW UPDATE (100Hz) ===================
+      // if (fabsf(C0_yaw) > 1e-4f)
+      // {
+      //   // 1. Get IMU yaw
+      //   esekf_float_t measured_imu_yaw = gocIMU * M_PI_F / 180.0f;
+      //   esekf_float_t corrected_imu_yaw = normalizeAngle_float(measured_imu_yaw - C0_yaw);
+      //   nominal_state[4] = corrected_imu_yaw; // Lấy thẳng từ IMU để tránh drift
+      //   // 2. Tính innovation
+      //   // esekf_float_t innovation_imu_yaw = normalizeAngle_float(corrected_imu_yaw - nominal_state[4]);
+
+      //   // // 3. Adaptive gain based on motion (quan trọng!)
+      //   // esekf_float_t adaptive_gain = 0.1f; // Base gain
+
+      //   // // Giảm gain khi đứng yên (gyro bias không ổn định)
+      //   // esekf_float_t motion_level = fabsf(gyro_z) + fabsf(accel[0]) + fabsf(accel[1]);
+      //   // if (motion_level < 0.1f)
+      //   // {
+      //   //   adaptive_gain *= 0.1f; // Reduce gain khi đứng yên
+      //   // }
+
+      //   // // 4. Trực tiếp update nominal state (simple approach)
+      //   // nominal_state[4] += adaptive_gain * innovation_imu_yaw;
+      //   // nominal_state[4] = normalizeAngle_float(nominal_state[4]);
+      //   // // Serial.print("IMU Yaw Update: ");
+      //   // // Serial.println(nominal_state[4] * 180.0f / M_PI_F);
+
+      //   // // 5. Update gyro bias
+      //   // error_state[5] += 0.001f * innovation_imu_yaw / dt;
+      // }
+
       xSemaphoreGive(stateMutex);
     }
 
@@ -736,7 +772,6 @@ void updateTask(void *pvParameters)
   PointECEF tempECEF;
 
   // Struct để gửi dữ liệu
-  ESKF_STATE_DATA eskf_data;
 
   // Khởi tạo H matrix một lần
   H[0 * ERROR_STATE_DIM + 0] = 1.0f;
@@ -747,6 +782,8 @@ void updateTask(void *pvParameters)
 
   uint8_t rtksta = 0;
   int32_t hAcc = 0, vAcc = 0, headingAcc = 0;
+
+  esekf_float_t heading = 0.0f;
 
   while (1)
   {
@@ -775,7 +812,7 @@ void updateTask(void *pvParameters)
       // Lấy velocity và heading (convert sang float sau khi tính toán)
       esekf_float_t vel_east = ((esekf_float_t)myGNSS.getNedEastVel()) / 1000.0f;
       esekf_float_t vel_north = ((esekf_float_t)myGNSS.getNedNorthVel()) / 1000.0f;
-      esekf_float_t heading = ((esekf_float_t)myGNSS.getHeading()) / 100000.0f;
+      heading = ((esekf_float_t)myGNSS.getHeading()) / 100000.0f;
 
       z[0] = current_east;
       z[1] = current_north;
@@ -797,6 +834,17 @@ void updateTask(void *pvParameters)
 
     if (PVT && xSemaphoreTake(stateMutex, (TickType_t)10) == pdTRUE)
     {
+      for (size_t i = 0; i < 5; i++)
+      {
+        Serial.print(nominal_state[i], 2);
+        Serial.print(",");
+      }
+
+      // =================== GNSS UPDATE (FLOAT) ===================
+
+      esekf_float_t measured_imu_yaw = gocIMU * M_PI_F / 180.0f;
+      esekf_float_t corrected_imu_yaw = normalizeAngle_float(measured_imu_yaw - C0_yaw);
+      z[4] = corrected_imu_yaw;
       // =================== LƯU P TRƯỚC KHI UPDATE ===================
       memcpy(P_before_update, P, sizeof(P_before_update));
 
@@ -814,7 +862,7 @@ void updateTask(void *pvParameters)
         memset(R, 0, sizeof(R));
         gnss_accuracies[0] = 1.0f;
         gnss_accuracies[1] = 0.5f;
-        gnss_accuracies[2] = 20.5f * M_PI_F / 180.0f;
+        gnss_accuracies[2] = 0.2f * M_PI_F / 180.0f;
 
         R[0 * 5 + 0] = gnss_accuracies[0] * gnss_accuracies[0];
         R[1 * 5 + 1] = gnss_accuracies[0] * gnss_accuracies[0];
@@ -827,7 +875,7 @@ void updateTask(void *pvParameters)
         {
           initial_Q[i] = Q[i * ERROR_STATE_DIM + i];
         }
-        //sage_husa_filter.initializeBaseQR(initial_Q, gnss_accuracies);
+        // sage_husa_filter.initializeBaseQR(initial_Q, gnss_accuracies);
       }
 
       // =================== MEASUREMENT UPDATE (FLOAT) ===================
@@ -840,7 +888,7 @@ void updateTask(void *pvParameters)
           normalizeAngle_float(z[4] - nominal_state[4])};
 
       // =================== SAGE-HUSA R ADAPTATION ===================
-      //sage_husa_filter.adaptR(innovation, H, P_before_update, gnss_accuracies, R);
+      // sage_husa_filter.adaptR(innovation, H, P_before_update, gnss_accuracies, R);
 
       // =================== TIẾP TỤC KALMAN UPDATE ===================
       // Tính S = H * P * H^T + R (FLOAT)
@@ -971,98 +1019,113 @@ void updateTask(void *pvParameters)
 
       // =================== BƯỚC 4: MINI-UPDATE DÙNG IMU YAW (RELATIVE ANGLE) ===================
       // Mục đích: Dùng độ mượt của IMU Yaw để hiệu chỉnh độ trôi (b_gz) và làm mượt dpsi
-      if (fabsf(C0_yaw) > 1e-4f) // Chỉ thực hiện nếu C0_yaw đã được tính toán ở setup
+      // if (fabsf(C0_yaw) > 1e-4f) // Chỉ thực hiện nếu C0_yaw đã được tính toán ở setup
+      // {
+      //   // 1. Góc IMU đã được chuyển sang radian (gocIMU đang là độ)
+      //   esekf_float_t measured_imu_yaw = gocIMU * M_PI_F / 180.0f;
+
+      //   // 2. Áp dụng góc bù trừ C0_yaw
+      //   // Đây là góc IMU đã được chuyển về hệ Navigation (North-referenced)
+      //   esekf_float_t corrected_imu_yaw = normalizeAngle_float(measured_imu_yaw - C0_yaw);
+
+      //   // 3. Tính toán Innovation (Sai số đo lường)
+      //   // Sai số = corrected_imu_yaw - nominal_state[4] (yaw hiện tại)
+      //   esekf_float_t innovation_imu_yaw = normalizeAngle_float(corrected_imu_yaw - nominal_state[4]);
+
+      //   // Ma trận H cho phép đo yaw (1x8)
+      //   // H_yaw = [0, 0, 0, 0, 1, 0, 0, 0]
+      //   // Ma trận R cho phép đo yaw (1x1) là R_yaw (đã được tính ở setup, R_yaw nhỏ)
+
+      //   // S_yaw = H_yaw * P * H_yaw^T + R_yaw  (S là số vô hướng 1x1)
+      //   esekf_float_t S_yaw = P[4 * ERROR_STATE_DIM + 4] + R_yaw;
+
+      //   // K_yaw = P * H_yaw^T * S_yaw_inv (K là véc-tơ 8x1)
+      //   esekf_float_t K_yaw[ERROR_STATE_DIM];
+      //   for (int i = 0; i < ERROR_STATE_DIM; i++)
+      //   {
+      //     // P[i * ERROR_STATE_DIM + 4] là cột 4 của P, tương đương P * H^T
+      //     K_yaw[i] = P[i * ERROR_STATE_DIM + 4] / S_yaw;
+      //   }
+
+      //   // Cập nhật trạng thái lỗi (cộng dồn với kết quả từ GPS update)
+      //   for (int i = 0; i < ERROR_STATE_DIM; i++)
+      //   {
+      //     error_state[i] += K_yaw[i] * innovation_imu_yaw;
+      //   }
+
+      //   // 2. TIÊM ERROR STATE VÀO NOMINAL STATE (QUAN TRỌNG!)
+      //   nominal_state[0] += error_state[0]; // p_E
+      //   nominal_state[1] += error_state[1]; // p_N
+      //   nominal_state[2] += error_state[2]; // v_E
+      //   nominal_state[3] += error_state[3]; // v_N
+      //   nominal_state[4] += error_state[4]; // ψ
+      //   nominal_state[4] = normalizeAngle_float(nominal_state[4]);
+
+      //   // 3. RESET ERROR STATE VỀ 0 (QUAN TRỌNG!)
+      //   error_state[0] = 0; // δp_E
+      //   error_state[1] = 0; // δp_N
+      //   error_state[2] = 0; // δv_E
+      //   error_state[3] = 0; // δv_N
+      //   error_state[4] = 0; // δψ
+
+      //   // Cập nhật hiệp phương sai: P = (I - K * H) * P (Sequential Update)
+      //   memset(I_KH, 0, sizeof(I_KH));
+      //   for (int i = 0; i < ERROR_STATE_DIM; i++)
+      //   {
+      //     for (int j = 0; j < ERROR_STATE_DIM; j++)
+      //     {
+      //       // H_yaw chỉ có phần tử thứ 4 là khác 0 (trạng thái dpsi)
+      //       esekf_float_t kh_ij = K_yaw[i] * ((j == 4) ? 1.0f : 0.0f);
+      //       I_KH[i * ERROR_STATE_DIM + j] = ((i == j) ? 1.0f : 0.0f) - kh_ij;
+      //     }
+      //   }
+
+      //   memset(P_new_imu, 0, sizeof(P_new_imu));
+      //   for (int i = 0; i < ERROR_STATE_DIM; i++)
+      //   {
+      //     for (int j = 0; j < ERROR_STATE_DIM; j++)
+      //     {
+      //       for (int k = 0; k < ERROR_STATE_DIM; k++)
+      //       {
+      //         P_new_imu[i * ERROR_STATE_DIM + j] += I_KH[i * ERROR_STATE_DIM + k] * P[k * ERROR_STATE_DIM + j];
+      //       }
+      //     }
+      //   }
+      //   memcpy(P, P_new_imu, sizeof(P)); // Ghi đè P mới
+
+      //   // Đảm bảo tính đối xứng
+      //   for (int i = 0; i < ERROR_STATE_DIM; i++)
+      //   {
+      //     for (int j = i + 1; j < ERROR_STATE_DIM; j++)
+      //     {
+      //       P[j * ERROR_STATE_DIM + i] = P[i * ERROR_STATE_DIM + j];
+      //     }
+      //   }
+
+      //   // Debug IMU yaw update
+      //   Serial.print(nominal_state[4] * 180.0f / M_PI_F, 2);
+      //   Serial.print("°, ");
+      //   Serial.print("IMU_YAW_UPDATE: corrected=");
+      //   Serial.print(corrected_imu_yaw * 180.0f / M_PI_F, 2);
+      //   Serial.print("°, innovation=");
+      //   Serial.print(innovation_imu_yaw * 180.0f / M_PI_F, 2);
+      //   Serial.print("°, C0=");
+      //   Serial.print(C0_yaw * 180.0f / M_PI_F, 2);
+      //   Serial.println("°");
+      // } // Kết thúc Update IMU
+
+      if ((headingAcc < 50000) && (myGNSS.getGroundSpeed() > int32_t(V_MIN_HEADING * 1000.0f)))
       {
-        // 1. Góc IMU đã được chuyển sang radian (gocIMU đang là độ)
         esekf_float_t measured_imu_yaw = gocIMU * M_PI_F / 180.0f;
-
-        // 2. Áp dụng góc bù trừ C0_yaw
-        // Đây là góc IMU đã được chuyển về hệ Navigation (North-referenced)
-        esekf_float_t corrected_imu_yaw = normalizeAngle_float(measured_imu_yaw - C0_yaw);
-
-        // 3. Tính toán Innovation (Sai số đo lường)
-        // Sai số = corrected_imu_yaw - nominal_state[4] (yaw hiện tại)
-        esekf_float_t innovation_imu_yaw = normalizeAngle_float(corrected_imu_yaw - nominal_state[4]);
-
-        // Ma trận H cho phép đo yaw (1x8)
-        // H_yaw = [0, 0, 0, 0, 1, 0, 0, 0]
-        // Ma trận R cho phép đo yaw (1x1) là R_yaw (đã được tính ở setup, R_yaw nhỏ)
-
-        // S_yaw = H_yaw * P * H_yaw^T + R_yaw  (S là số vô hướng 1x1)
-        esekf_float_t S_yaw = P[4 * ERROR_STATE_DIM + 4] + R_yaw;
-
-        // K_yaw = P * H_yaw^T * S_yaw_inv (K là véc-tơ 8x1)
-        esekf_float_t K_yaw[ERROR_STATE_DIM];
-        for (int i = 0; i < ERROR_STATE_DIM; i++)
-        {
-          // P[i * ERROR_STATE_DIM + 4] là cột 4 của P, tương đương P * H^T
-          K_yaw[i] = P[i * ERROR_STATE_DIM + 4] / S_yaw;
-        }
-
-        // Cập nhật trạng thái lỗi (cộng dồn với kết quả từ GPS update)
-        for (int i = 0; i < ERROR_STATE_DIM; i++)
-        {
-          error_state[i] += K_yaw[i] * innovation_imu_yaw;
-        }
-
-        // 2. TIÊM ERROR STATE VÀO NOMINAL STATE (QUAN TRỌNG!)
-        nominal_state[0] += error_state[0]; // p_E
-        nominal_state[1] += error_state[1]; // p_N
-        nominal_state[2] += error_state[2]; // v_E
-        nominal_state[3] += error_state[3]; // v_N
-        nominal_state[4] += error_state[4]; // ψ
-        nominal_state[4] = normalizeAngle_float(nominal_state[4]);
-
-        // 3. RESET ERROR STATE VỀ 0 (QUAN TRỌNG!)
-        error_state[0] = 0; // δp_E
-        error_state[1] = 0; // δp_N
-        error_state[2] = 0; // δv_E
-        error_state[3] = 0; // δv_N
-        error_state[4] = 0; // δψ
-
-        // Cập nhật hiệp phương sai: P = (I - K * H) * P (Sequential Update)
-        memset(I_KH, 0, sizeof(I_KH));
-        for (int i = 0; i < ERROR_STATE_DIM; i++)
-        {
-          for (int j = 0; j < ERROR_STATE_DIM; j++)
-          {
-            // H_yaw chỉ có phần tử thứ 4 là khác 0 (trạng thái dpsi)
-            esekf_float_t kh_ij = K_yaw[i] * ((j == 4) ? 1.0f : 0.0f);
-            I_KH[i * ERROR_STATE_DIM + j] = ((i == j) ? 1.0f : 0.0f) - kh_ij;
-          }
-        }
-
-        memset(P_new_imu, 0, sizeof(P_new_imu));
-        for (int i = 0; i < ERROR_STATE_DIM; i++)
-        {
-          for (int j = 0; j < ERROR_STATE_DIM; j++)
-          {
-            for (int k = 0; k < ERROR_STATE_DIM; k++)
-            {
-              P_new_imu[i * ERROR_STATE_DIM + j] += I_KH[i * ERROR_STATE_DIM + k] * P[k * ERROR_STATE_DIM + j];
-            }
-          }
-        }
-        memcpy(P, P_new_imu, sizeof(P)); // Ghi đè P mới
-
-        // Đảm bảo tính đối xứng
-        for (int i = 0; i < ERROR_STATE_DIM; i++)
-        {
-          for (int j = i + 1; j < ERROR_STATE_DIM; j++)
-          {
-            P[j * ERROR_STATE_DIM + i] = P[i * ERROR_STATE_DIM + j];
-          }
-        }
-
-        // Debug IMU yaw update
-        Serial.print("IMU_YAW_UPDATE: corrected=");
-        Serial.print(corrected_imu_yaw * 180.0f / M_PI_F, 2);
-        Serial.print("°, innovation=");
-        Serial.print(innovation_imu_yaw * 180.0f / M_PI_F, 2);
-        Serial.print("°, C0=");
-        Serial.print(C0_yaw * 180.0f / M_PI_F, 2);
-        Serial.println("°");
-      } // Kết thúc Update IMU
+        esekf_float_t gnss_heading = heading * M_PI_F / 180.0f; // GNSS heading từ measurement
+        gnss_heading = normalizeAngle_float(gnss_heading);
+        // Low-pass filter cho C0_yaw
+        esekf_float_t alpha_calib = 0.05f; // Rất chậm
+        C0_yaw = (1.0f - alpha_calib) * C0_yaw +
+                 alpha_calib * (measured_imu_yaw - gnss_heading);
+        // Serial.print("C0_yaw updated: ");
+        // Serial.println(C0_yaw * 180.0f / M_PI_F, 2);
+      }
 
       // =================== GỬI DỮ LIỆU QUA SERIAL ===================
       // Điền dữ liệu vào struct
@@ -1078,12 +1141,9 @@ void updateTask(void *pvParameters)
       }
 
       // Dữ liệu cảm biến thô
-      eskf_data.raw_data[0] = accel[0];               // ax
-      eskf_data.raw_data[1] = accel[1];               // ay
-      eskf_data.raw_data[2] = gocIMU;                 // yaw IMU (độ)
-      eskf_data.raw_data[3] = gyro_z;                 // gz (rad/s)
-      eskf_data.raw_data[4] = (esekf_float_t)z[0];    // current east X
-      eskf_data.raw_data[5] = (esekf_float_t)z[1];    // current north Y
+
+      eskf_data.raw_data[4] = z[0];                   // current east X
+      eskf_data.raw_data[5] = z[1];                   // current north Y
       eskf_data.raw_data[6] = z[2];                   // v_east
       eskf_data.raw_data[7] = z[3];                   // v_north
       eskf_data.raw_data[8] = z[4] * 180.0f / M_PI_F; // heading (độ)
@@ -1102,11 +1162,17 @@ void updateTask(void *pvParameters)
       //  Serial.print("ESKF_DATA,");
       //  Serial.print(eskf_data.timestamp);
       //  Serial.print(",");
-      // for (int i = 0; i < 5; i++)
-      // {
-      //   Serial.print(eskf_data.state[i], 3);
-      //   Serial.print(",");
-      // }
+      for (int i = 0; i < 5; i++)
+      {
+        Serial.print(eskf_data.state[i], 3);
+        Serial.print(",");
+        if (i == 4)
+        {
+          Serial.print(eskf_data.state[4] * 180.0f / M_PI_F, 2);
+          Serial.print(",");
+        }
+      }
+      // Serial.print(correct)
       // for (int i = 0; i < 8; i++)
       // {
       //   Serial.print(eskf_data.P_diag[i], 8);
@@ -1123,7 +1189,8 @@ void updateTask(void *pvParameters)
       //   if (i < 2)
       //     Serial.print(",");
       // }
-      Serial.println();
+      // Serial.print(C0_yaw * 180.0f / M_PI_F, 2); // In C0_yaw để debug
+      // Serial.println();
 
       xSemaphoreGive(stateMutex);
     }
@@ -1222,9 +1289,9 @@ void setup()
   sage_husa_filter.setParameters(
       0.97f, // forgetting_factor
       0.1f,  // q_min_ratio
-      5.0f,  // q_max_ratio (conservative)
+      2.0f,  // q_max_ratio (conservative)
       0.1f,  // r_min_ratio
-      5.0f   // r_max_ratio (conservative)
+      2.0f   // r_max_ratio (conservative)
   );
 
   // KHỐI 4: CHỜ TÍN HIỆU VÀ THIẾT LẬP GỐC TỌA ĐỘ ENU
@@ -1406,8 +1473,8 @@ void setup()
 
   // KHỐI 6: TẠO CÁC TÁC VỤ (TASKS)
   Serial.println("Creating FreeRTOS tasks...");
-  xTaskCreatePinnedToCore(predictionTask, "Prediction", 8192, NULL, 5, NULL, 0); // Core 0
-  xTaskCreatePinnedToCore(updateTask, "Update", 12288, NULL, 5, NULL, 1);        // Core 1
+  // xTaskCreatePinnedToCore(predictionTask, "Prediction", 8192, NULL, 5, NULL, 0); // Core 0
+  xTaskCreatePinnedToCore(updateTask, "Update", 12288, NULL, 5, NULL, 1); // Core 1
   Serial.println("System initialized successfully. ES-EKF is running.");
   // delay(2000);
 }
