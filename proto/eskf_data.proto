@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+// Bắt buộc phải thêm dòng này để sử dụng các tùy chọn của Nanopb
+import "nanopb.proto";
+
+message EskfStateData {
+  // Thêm (nanopb).max_count để chỉ định kích thước mảng
+  repeated float state_pre = 1 [(nanopb).max_count = 5];
+  repeated float state = 2 [(nanopb).max_count = 5];
+  repeated float P_diag = 3 [(nanopb).max_count = 8];
+  repeated float raw_data = 4 [(nanopb).max_count = 9];
+  repeated float gnss_accuracy = 5 [(nanopb).max_count = 3];
+  
+  uint32 timestamp = 6;
+}

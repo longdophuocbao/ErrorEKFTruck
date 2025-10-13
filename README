@@ -1,0 +1,30 @@
+// README
+# Hệ Thống Lọc Kalman Mở Rộng Lỗi (Error-State Extended Kalman Filter - ESEKF)
+State[0]: Vị trí phía Đông (pos_east) - Tọa độ X trong hệ quy chiếu cục bộ. Đơn vị: mét (m).
+State[1]: Vị trí phía Bắc (pos_north) - Tọa độ Y trong hệ quy chiếu cục bộ. Đơn vị: mét (m).
+State[2]: Vận tốc hướng Đông (v_east) - Thành phần vận tốc theo hướng Đông. Đơn vị: mét/giây (m/s).
+State[3]: Vận tốc hướng Bắc (v_north) - Thành phần vận tốc theo hướng Bắc. Đơn vị: mét/giây (m/s).
+State[4]: Góc Yaw (yaw) - Góc lệch (hướng) của phương tiện. Đơn vị: độ (°).
+
+P_diag[0]: Phương sai vị trí phía Đông (var_pos_east) - Độ không chắc chắn về vị trí phía Đông. Đơn vị: m².
+P_diag[1]: Phương sai vị trí phía Bắc (var_pos_north) - Độ không chắc chắn về vị trí phía Bắc. Đơn vị: m².
+P_diag[2]: Phương sai vận tốc hướng Đông (var_v_east) - Độ không chắc chắn về vận tốc hướng Đông. Đơn vị: (m/s)².
+P_diag[3]: Phương sai vận tốc hướng Bắc (var_v_north) - Độ không chắc chắn về vận tốc hướng Bắc. Đơn vị: (m/s)².
+P_diag[4]: Phương sai góc Yaw (var_yaw) - Độ không chắc chắn về góc Yaw. Đơn vị: (°)².
+P_diag[5]: Phương sai sai số gia tốc theo trục X (var_accel_x_bias) - Độ không chắc chắn về sai số gia tốc theo trục X. Đơn vị: (m/s²)².
+P_diag[6]: Phương sai sai số gia tốc theo trục Y (var_accel_y_bias) - Độ không chắc chắn về sai số gia tốc theo trục Y. Đơn vị: (m/s²)².
+P_diag[7]: Phương sai sai số vận tốc góc quanh trục Z (var_gyro_z_bias) - Độ không chắc chắn về sai số vận tốc góc quanh trục Z. Đơn vị: (rad/s)².
+
+raw_data[0]: Gia tốc theo trục X (accel_x) - Gia tốc dọc theo trục X của IMU. Đơn vị: m/s 
+raw_data[1]: Gia tốc theo trục Y (accel_y) - Gia tốc dọc theo trục Y của IMU. Đơn vị: m/s 
+raw_data[2]: Góc Yaw từ IMU (yaw_IMU) - Góc lệch (hướng) tính toán từ IMU. Đơn vị: độ (°).
+raw_data[3]: Vận tốc góc quanh trục Z (gyro_z) - Tốc độ quay quanh trục Z (thẳng đứng) từ con quay hồi chuyển. Đơn vị: rad/s.
+raw_data[4]: Vị trí phía Đông (GNSS East) - Tọa độ X (hướng Đông) trong hệ quy chiếu cục bộ, lấy từ phép đo GNSS. Đơn vị: mét (m).
+raw_data[5]: Vị trí phía Bắc (GNSS North) - Tọa độ Y (hướng Bắc) trong hệ quy chiếu cục bộ, lấy từ phép đo GNSS. Đơn vị: mét (m).
+raw_data[6]: Vận tốc hướng Đông (GNSS v_east) - Thành phần vận tốc theo hướng Đông từ phép đo GNSS. Đơn vị: mét/giây (m/s).
+raw_data[7]: Vận tốc hướng Bắc (GNSS v_north) - Thành phần vận tốc theo hướng Bắc từ phép đo GNSS. Đơn vị: mét/giây (m/s).
+raw_data[8]: Góc Hướng từ GNSS (GNSS Heading) - Góc hướng (cap) từ GNSS sau khi đã được chuẩn hóa. Đơn vị: độ (°).
+
+gnss_accuracy[0]: Độ chính xác vị trí (GNSS pos_accuracy) - Độ chính xác của vị trí từ GNSS. Đơn vị: mét (m).
+gnss_accuracy[1]: Độ chính xác vận tốc (GNSS vel_accuracy) - Độ chính xác của vận tốc từ GNSS. Đơn vị: mét/giây (m/s).
+gnss_accuracy[2]: Độ chính xác góc hướng (GNSS heading_accuracy) - Độ chính xác của góc hướng từ GNSS. Đơn vị: độ (°).

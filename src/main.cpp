@@ -1,13 +1,29 @@
 // ES-EKF Hybrid Optimized for ESP32
 #include <Wire.h>
 #include <SparkFun_u-blox_GNSS_v3.h>
-#include <esp_now.h>
-#include <WiFi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <REG.h>
 #include <wit_c_sdk.h>
 #include <freertos/semphr.h>
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+#include "pb_encode.h" // Thư viện lõi của Nanopb
+#include "generated/eskf_data.pb.h"
+
+// --- CẤU HÌNH CẦN THAY ĐỔI ---
+const char *ssid = "BaoLong";
+const char *password = "baolong123";
+const char *mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+const char *mqtt_topic = "esp32/eskf_data_proto"; // Đổi topic để phân biệt
+
+// --- KHỞI TẠO CÁC ĐỐI TƯỢNG ---
+WiFiClient espClient;
+PubSubClient client(espClient);
+
 
 const int PREDICTION_RATE_HZ = 100; // IMU fusion rate
 const int UPDATE_RATE_HZ = 10;      // GNSS update rate
@@ -27,18 +43,19 @@ const uint8_t SYNC_BYTE = 0xAA; // Sync header
 
 struct ESKF_STATE_DATA
 {
+  esekf_float_t state_pre[NOMINAL_STATE_DIM];
   esekf_float_t state[NOMINAL_STATE_DIM]; // Float cho output
   esekf_float_t P_diag[ERROR_STATE_DIM];
   esekf_float_t raw_data[9];
   esekf_float_t gnss_accuracy[3];
   uint32_t timestamp;
-} __attribute__((packed));
+};
 
 struct TUNING_CONFIG
 {
   esekf_float_t Q_noise_params[3];
   esekf_float_t R_noise_params[3];
-} __attribute__((packed));
+};
 
 TUNING_CONFIG currentConfig;
 
@@ -352,6 +369,106 @@ public:
   }
 };
 
+// --- CÁC HÀM WIFI VÀ MQTT (không thay đổi) ---
+void setup_wifi()
+{
+  delay(10);
+  Serial.print("Dang ket noi toi WiFi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nDa ket noi WiFi!");
+  Serial.print("Dia chi IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void reconnect()
+{
+  while (!client.connected())
+  {
+    Serial.print("Dang thu ket noi MQTT...");
+    if (client.connect("ESP32_Client_Protobuf"))
+    {
+      Serial.println("da ket noi!");
+    }
+    else
+    {
+      Serial.print("that bai, rc=");
+      Serial.print(client.state());
+      Serial.println(" thu lai sau 5 giay");
+      delay(5000);
+    }
+  }
+}
+
+// --- HÀM GỬI DỮ LIỆU ĐÃ ĐƯỢC CẬP NHẬT SANG PROTOBUF ---
+void publishData(const ESKF_STATE_DATA &data)
+{
+  // Tạo một đối tượng message Protobuf
+  EskfStateData message = EskfStateData_init_default;
+
+  // Tạo một buffer để chứa dữ liệu đã được mã hóa
+  // Kích thước 256 bytes là quá đủ cho struct này
+  uint8_t buffer[256];
+
+  // Tạo một stream đầu ra để ghi vào buffer
+  pb_ostream_t stream = pb_ostream_from_buffer(buffer, sizeof(buffer));
+
+  // --- SAO CHÉP DỮ LIỆU TỪ STRUCT SANG MESSAGE PROTOBUF ---
+  // Đối với các mảng (repeated fields), chúng ta cần sao chép dữ liệu
+  // và thiết lập trường `_count` để nanopb biết mảng có bao nhiêu phần tử.
+
+  // Sao chép mảng 'state'
+  memcpy(message.state_pre, data.state_pre, sizeof(data.state_pre));
+  message.state_pre_count = 5;
+
+  memcpy(message.state, data.state, sizeof(data.state));
+  message.state_count = 5;
+
+  // Sao chép mảng 'P_diag'
+  memcpy(message.P_diag, data.P_diag, sizeof(data.P_diag));
+  message.P_diag_count = 8;
+
+  // Sao chép mảng 'raw_data'
+  memcpy(message.raw_data, data.raw_data, sizeof(data.raw_data));
+  message.raw_data_count = 9;
+
+  // Sao chép mảng 'gnss_accuracy'
+  memcpy(message.gnss_accuracy, data.gnss_accuracy, sizeof(data.gnss_accuracy));
+  message.gnss_accuracy_count = 3;
+
+  // Gán timestamp
+  message.timestamp = data.timestamp;
+
+  // --- MÃ HÓA DỮ LIỆU ---
+  bool status = pb_encode(&stream, EskfStateData_fields, &message);
+
+  if (!status)
+  {
+    Serial.println("Loi ma hoa Protobuf!");
+    return;
+  }
+
+  Serial.print("Du lieu Protobuf da ma hoa xong. Kich thuoc: ");
+  Serial.print(stream.bytes_written);
+  Serial.println(" bytes.");
+
+  // --- GỬI DỮ LIỆU NHỊ PHÂN LÊN MQTT ---
+  // Chúng ta gửi con trỏ tới buffer và độ dài chính xác của dữ liệu
+  if (client.publish(mqtt_topic, buffer, stream.bytes_written))
+  {
+    Serial.println("Gui du lieu thanh cong!");
+  }
+  else
+  {
+    Serial.println("Gui du lieu that bai!");
+  }
+}
+
 // Sage-Husa Adaptive Filter
 static SageHusaAdaptiveFilter sage_husa_filter;
 static esekf_float_t P_before_update[ERROR_STATE_DIM * ERROR_STATE_DIM]; // Lưu P trước update
@@ -550,7 +667,7 @@ void predictionTask(void *pvParameters)
       vTaskDelayUntil(&xLastWakeTime, xFrequency);
       continue;
     }
-
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
     // Đọc IMU
     WitReadReg(AX, 12);
     delay(1);
@@ -745,7 +862,7 @@ void predictionTask(void *pvParameters)
       xSemaphoreGive(stateMutex);
     }
 
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    //vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
 }
 
@@ -787,6 +904,14 @@ void updateTask(void *pvParameters)
 
   while (1)
   {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    if (!client.connected())
+    {
+      reconnect();
+    }
+    client.loop();
+
     bool PVT = false;
     esekf_float_t z[5] = {0, 0, 0, 0, 0};
 
@@ -834,11 +959,17 @@ void updateTask(void *pvParameters)
 
     if (PVT && xSemaphoreTake(stateMutex, (TickType_t)10) == pdTRUE)
     {
-      for (size_t i = 0; i < 5; i++)
-      {
-        Serial.print(nominal_state[i], 2);
-        Serial.print(",");
-      }
+      // for (size_t i = 0; i < 5; i++)
+      // {
+      //   Serial.print(nominal_state[i], 2);
+      //   Serial.print(",");
+      //   if (i == 4)
+      //   {
+      //     Serial.print(nominal_state[i] * 180.0f / M_PI_F, 2);
+      //     Serial.print(",");
+      //   }
+      // }
+      memcpy(eskf_data.state_pre, nominal_state, sizeof(nominal_state));
 
       // =================== GNSS UPDATE (FLOAT) ===================
 
@@ -860,8 +991,8 @@ void updateTask(void *pvParameters)
       if (sage_husa_filter.getUpdateCount() == 0)
       {
         memset(R, 0, sizeof(R));
-        gnss_accuracies[0] = 1.0f;
-        gnss_accuracies[1] = 0.5f;
+        gnss_accuracies[0] = 0.3f; // 0.8f
+        gnss_accuracies[1] = 0.2f;
         gnss_accuracies[2] = 0.2f * M_PI_F / 180.0f;
 
         R[0 * 5 + 0] = gnss_accuracies[0] * gnss_accuracies[0];
@@ -1114,17 +1245,26 @@ void updateTask(void *pvParameters)
       //   Serial.println("°");
       // } // Kết thúc Update IMU
 
-      if ((headingAcc < 50000) && (myGNSS.getGroundSpeed() > int32_t(V_MIN_HEADING * 1000.0f)))
+      if (myGNSS.getGroundSpeed() > int32_t(V_MIN_HEADING * 1000.0f))
       {
         esekf_float_t measured_imu_yaw = gocIMU * M_PI_F / 180.0f;
         esekf_float_t gnss_heading = heading * M_PI_F / 180.0f; // GNSS heading từ measurement
         gnss_heading = normalizeAngle_float(gnss_heading);
         // Low-pass filter cho C0_yaw
-        esekf_float_t alpha_calib = 0.05f; // Rất chậm
-        C0_yaw = (1.0f - alpha_calib) * C0_yaw +
-                 alpha_calib * (measured_imu_yaw - gnss_heading);
+        esekf_float_t alpha_calib = 0.02f; // Rất chậm
+        // C0_yaw = (1.0f - alpha_calib) * C0_yaw +
+        //          alpha_calib * (measured_imu_yaw - gnss_heading);
+
         // Serial.print("C0_yaw updated: ");
-        // Serial.println(C0_yaw * 180.0f / M_PI_F, 2);
+        // Serial.print(C0_yaw * 180.0f / M_PI_F, 2);
+        // Serial.print("IMU Yaw: ");
+        // Serial.print(measured_imu_yaw * 180.0f / M_PI_F, 2);
+        // Serial.print("°, GNSS Heading: ");
+        // Serial.print(gnss_heading * 180.0f / M_PI_F, 2);
+        // Serial.print("°");
+        // Serial.print(", nominal yaw: ");
+        // Serial.print(nominal_state[4] * 180.0f / M_PI_F, 2);
+        // Serial.println("°");
       }
 
       // =================== GỬI DỮ LIỆU QUA SERIAL ===================
@@ -1142,16 +1282,19 @@ void updateTask(void *pvParameters)
 
       // Dữ liệu cảm biến thô
 
-      eskf_data.raw_data[4] = z[0];                   // current east X
-      eskf_data.raw_data[5] = z[1];                   // current north Y
-      eskf_data.raw_data[6] = z[2];                   // v_east
-      eskf_data.raw_data[7] = z[3];                   // v_north
-      eskf_data.raw_data[8] = z[4] * 180.0f / M_PI_F; // heading (độ)
+      eskf_data.raw_data[4] = z[0];                                                              // current east X
+      eskf_data.raw_data[5] = z[1];                                                              // current north Y
+      eskf_data.raw_data[6] = z[2];                                                              // v_east
+      eskf_data.raw_data[7] = z[3];                                                              // v_north
+      eskf_data.raw_data[8] = normalizeAngle_float(heading * M_PI_F / 180.0f) * 180.0f / M_PI_F; // heading (độ)
 
       // Độ chính xác GNSS
       eskf_data.gnss_accuracy[0] = (esekf_float_t)hAcc / 1000.0f;        // hAcc (m)
       eskf_data.gnss_accuracy[1] = (esekf_float_t)vAcc / 1000.0f;        // vAcc (m/s)
       eskf_data.gnss_accuracy[2] = (esekf_float_t)headingAcc / 10000.0f; // headingAcc (độ)
+
+      // Gửi dữ liệu qua MQTT
+      publishData(eskf_data);
 
       // // Gửi qua Serial dưới dạng binary
       // Serial.write(&SYNC_BYTE, 1); // Sync 0xAA
@@ -1162,16 +1305,16 @@ void updateTask(void *pvParameters)
       //  Serial.print("ESKF_DATA,");
       //  Serial.print(eskf_data.timestamp);
       //  Serial.print(",");
-      for (int i = 0; i < 5; i++)
-      {
-        Serial.print(eskf_data.state[i], 3);
-        Serial.print(",");
-        if (i == 4)
-        {
-          Serial.print(eskf_data.state[4] * 180.0f / M_PI_F, 2);
-          Serial.print(",");
-        }
-      }
+      // for (int i = 0; i < 5; i++)
+      // {
+      //   Serial.print(eskf_data.state[i], 3);
+      //   Serial.print(",");
+      //   if (i == 4)
+      //   {
+      //     Serial.print(eskf_data.state[4] * 180.0f / M_PI_F, 2);
+      //     Serial.print(",");
+      //   }
+      // }
       // Serial.print(correct)
       // for (int i = 0; i < 8; i++)
       // {
@@ -1195,7 +1338,7 @@ void updateTask(void *pvParameters)
       xSemaphoreGive(stateMutex);
     }
 
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    // vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
 }
 
@@ -1241,10 +1384,13 @@ void setup()
 {
   // KHỐI 1: KHỞI TẠO HỆ THỐNG CỐT LÕI
   setCpuFrequencyMhz(240);
-  delay(500); // Chờ hệ thống ổn định
+  delay(100); // Chờ hệ thống ổn định
 
   Serial.begin(115200);
   Serial.println("System Core Initializing...");
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
 
   // Tạo Mutex để bảo vệ các biến dùng chung giữa các task
   stateMutex = xSemaphoreCreateMutex();
@@ -1422,13 +1568,7 @@ void setup()
   {
     WitSerialDataIn(Serial1.read());
   }
-  // if (s_cDataUpdate & GYRO_UPDATE)
-  // {
-  //   gyro_z = sReg[GZ] / 32768.0f * 2000.0f * M_PI / 180.0; // Chuyển sang rad/s
-  //   Serial.print("Gyro Z (rad/s): ");
-  //   Serial.println(gyro_z, 4);
-  //   s_cDataUpdate &= ~GYRO_UPDATE;
-  // }
+
   if (s_cDataUpdate & ANGLE_UPDATE)
   {
     esekf_float_t initial_imu_yaw_deg = sReg[Yaw] / 32768.0f * 180.0f * -1.0f;
@@ -1458,11 +1598,11 @@ void setup()
   // --- 5.4: Khởi tạo ma trận nhiễu quá trình Q ---
   esekf_float_t vel_noise_std_dev = 1.5f;
   esekf_float_t accel_bias_noise_std_dev = 0.86999f;
-  esekf_float_t gyro_bias_noise_std_dev = 1.8994f;
+  esekf_float_t gyro_bias_noise_std_dev = 0.008994f;
 
   Q[2 * ERROR_STATE_DIM + 2] = vel_noise_std_dev * vel_noise_std_dev;
   Q[3 * ERROR_STATE_DIM + 3] = vel_noise_std_dev * vel_noise_std_dev;
-  Q[4 * ERROR_STATE_DIM + 4] = (100.0f * M_PI_F / 180.0f) * (100.0f * M_PI_F / 180.0f); // Nhiễu đo của Gyro
+  Q[4 * ERROR_STATE_DIM + 4] = (0.001f * M_PI_F / 180.0f) * (0.001f * M_PI_F / 180.0f); // Nhiễu đo của Gyro
   Q[5 * ERROR_STATE_DIM + 5] = gyro_bias_noise_std_dev * gyro_bias_noise_std_dev;
   Q[6 * ERROR_STATE_DIM + 6] = accel_bias_noise_std_dev * accel_bias_noise_std_dev;
   Q[7 * ERROR_STATE_DIM + 7] = accel_bias_noise_std_dev * accel_bias_noise_std_dev;
@@ -1473,8 +1613,8 @@ void setup()
 
   // KHỐI 6: TẠO CÁC TÁC VỤ (TASKS)
   Serial.println("Creating FreeRTOS tasks...");
-  // xTaskCreatePinnedToCore(predictionTask, "Prediction", 8192, NULL, 5, NULL, 0); // Core 0
-  xTaskCreatePinnedToCore(updateTask, "Update", 12288, NULL, 5, NULL, 1); // Core 1
+  xTaskCreatePinnedToCore(predictionTask, "Prediction", 8192, NULL, 5, NULL, 0); // Core 0
+  xTaskCreatePinnedToCore(updateTask, "Update", 12288, NULL, 5, NULL, 1);        // Core 1
   Serial.println("System initialized successfully. ES-EKF is running.");
   // delay(2000);
 }
